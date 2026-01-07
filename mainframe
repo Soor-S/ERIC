@@ -1,0 +1,1029 @@
+############################################################
+# runtime_squat.py
+# Squat Coach with local ERIC LLM
+#
+# - Pose detection (MediaPipe)
+# - Rep segmentation
+# - Feature extraction
+# - Scoring (expert + optional personal profile)
+# - Beginner / Expert (calibration) modes
+# - ERIC rep feedback (per rep)
+# - ERIC per-rep set report (key: R)
+# - ERIC tutorial (key: T)
+# - Chat with ERIC (key: C, press again to close)
+#   - While in chat, type "m" on its own line to use microphone
+# - Voice TTS toggle (key: V)
+############################################################
+
+import os
+import time
+import json
+from typing import Dict, List, Tuple, Optional
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import pyttsx3
+
+from Local_trainer_LLM import LLMCoach
+
+
+############################################################
+#                TEXT-TO-SPEECH (pyttsx3)
+############################################################
+
+_engine = pyttsx3.init()
+_engine.setProperty("rate", 175)
+
+
+def speak(text: str):
+    try:
+        _engine.say(text)
+        _engine.runAndWait()
+    except Exception:
+        # Fail silently if TTS has issues
+        pass
+
+
+############################################################
+#                    POSE DETECTION
+############################################################
+
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=2,
+    min_detection_confidence=0.30,
+    min_tracking_confidence=0.30,
+)
+
+
+############################################################
+#                 GEOMETRY / ANGLE HELPERS
+############################################################
+
+def angle2d_deg(a, b, c) -> Optional[float]:
+    """2D joint angle in degrees (A-B-C) using screen-space coords."""
+    a = np.array(a, dtype=np.float32)
+    b = np.array(b, dtype=np.float32)
+    c = np.array(c, dtype=np.float32)
+    v1 = a - b
+    v2 = c - b
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return None
+    dot = float(np.dot(v1, v2))
+    cross = float(np.cross(v1, v2))
+    ang = float(np.degrees(np.arctan2(abs(cross), dot)))
+    return ang
+
+
+def lm_xy(lms, idx: int, w: int, h: int) -> Tuple[float, float]:
+    return (lms[idx].x * w, lms[idx].y * h)
+
+
+def compute_angles(lms, w: int, h: int) -> Dict[str, Optional[float]]:
+    """
+    Extract joint angles for a single frame:
+      - knee_L / knee_R
+      - trunk (hip-mid to shoulder-mid vs vertical)
+    """
+    out: Dict[str, Optional[float]] = {}
+    if lms is None:
+        return out
+
+    LHIP, LKNE, LANK = 23, 25, 27
+    RHIP, RKNE, RANK = 24, 26, 28
+    LSH, RSH = 11, 12
+
+    # Knees
+    try:
+        out["knee_L"] = angle2d_deg(
+            lm_xy(lms, LHIP, w, h),
+            lm_xy(lms, LKNE, w, h),
+            lm_xy(lms, LANK, w, h),
+        )
+        out["knee_R"] = angle2d_deg(
+            lm_xy(lms, RHIP, w, h),
+            lm_xy(lms, RKNE, w, h),
+            lm_xy(lms, RANK, w, h),
+        )
+    except Exception:
+        out["knee_L"] = None
+        out["knee_R"] = None
+
+    # Trunk angle (hip-mid → shoulder-mid vs vertical)
+    try:
+        hip_mid = (
+            (lm_xy(lms, LHIP, w, h)[0] + lm_xy(lms, RHIP, w, h)[0]) / 2.0,
+            (lm_xy(lms, LHIP, w, h)[1] + lm_xy(lms, RHIP, w, h)[1]) / 2.0,
+        )
+        sh_mid = (
+            (lm_xy(lms, LSH, w, h)[0] + lm_xy(lms, RSH, w, h)[0]) / 2.0,
+            (lm_xy(lms, LSH, w, h)[1] + lm_xy(lms, RSH, w, h)[1]) / 2.0,
+        )
+        v = np.array([sh_mid[0] - hip_mid[0], sh_mid[1] - hip_mid[1]], dtype=np.float32)
+        out["trunk"] = float(np.degrees(np.arctan2(abs(v[0]), v[1] + 1e-6)))
+    except Exception:
+        out["trunk"] = None
+
+    return out
+
+
+############################################################
+#                 REP DETECTOR (KNEE-DRIVEN)
+############################################################
+
+class RepDetector:
+    """
+    Detects squat reps using knee angle:
+    - start when angle decreases (down)
+    - bottom when direction switches to up
+    - end when angle increases then reverses or flattens
+    """
+
+    def __init__(self, min_rom: float = 25.0, deadband: float = 0.5, refractory: float = 0.30):
+        self.min_rom = min_rom
+        self.deadband = deadband
+        self.refractory = refractory
+
+        self.prev: Optional[float] = None
+        self.state: str = "top"   # top → down → up → top
+        self.state_t: float = 0.0
+
+        self.start_t: Optional[float] = None
+        self.bottom_t: Optional[float] = None
+        self.end_t: Optional[float] = None
+
+        self.knee_min: Optional[float] = None
+        self.knee_max: Optional[float] = None
+
+        self.rep_count: int = 0
+
+    def _direction(self, delta: float) -> int:
+        if abs(delta) <= self.deadband:
+            return 0
+        return 1 if delta > 0 else -1
+
+    def update(self, t: float, knee_angle: Optional[float]) -> Dict[str, bool]:
+        ev: Dict[str, bool] = {}
+
+        if knee_angle is None:
+            return ev
+
+        if self.prev is None:
+            self.prev = knee_angle
+            self.knee_min = knee_angle
+            self.knee_max = knee_angle
+            self.state_t = t
+            return ev
+
+        delta = knee_angle - self.prev
+        direction = self._direction(delta)
+
+        # Track ROM
+        self.knee_min = min(self.knee_min, knee_angle) if self.knee_min is not None else knee_angle
+        self.knee_max = max(self.knee_max, knee_angle) if self.knee_max is not None else knee_angle
+
+        # TOP → DOWN
+        if self.state == "top" and direction < 0:
+            self.state = "down"
+            self.start_t = t
+            self.knee_min = knee_angle
+            self.knee_max = knee_angle
+            ev["rep_start"] = True
+
+        # DOWN → UP (bottom)
+        elif self.state == "down" and direction > 0:
+            self.state = "up"
+            self.bottom_t = t
+            ev["bottom"] = True
+
+        # UP → TOP (rep end)
+        elif self.state == "up":
+            if direction < 0 and (t - self.state_t) >= self.refractory:
+                rom = (self.knee_max - self.knee_min) if (self.knee_max is not None and self.knee_min is not None) else 0.0
+                if rom >= self.min_rom:
+                    self.end_t = t
+                    ev["rep_complete"] = True
+                    self.rep_count += 1
+                self.state = "top"
+                self.state_t = t
+
+        self.prev = knee_angle
+        if direction != 0:
+            self.state_t = t
+
+        return ev
+
+
+############################################################
+#           TIME-SERIES RESAMPLING & FEATURES
+############################################################
+
+def resample_wave(time_series: List[Tuple[float, float]], T: int = 200) -> List[float]:
+    """Resample a list of (t, value) pairs to length T."""
+    if not time_series or len(time_series) < 3:
+        return [0.0] * T
+
+    ts = np.array([p[0] for p in time_series], dtype=np.float32)
+    xs = np.array([p[1] for p in time_series], dtype=np.float32)
+    t0, t1 = float(ts[0]), float(ts[-1])
+
+    if t1 <= t0:
+        return [float(xs[-1])] * T
+
+    s = (ts - t0) / (t1 - t0)
+    s_new = np.linspace(0.0, 1.0, T, dtype=np.float32)
+    return np.interp(s_new, s, xs).tolist()
+
+
+def extract_rep_features(
+    rep_slice: Dict[str, List[Tuple[float, float]]],
+    t_start: float,
+    t_bottom: Optional[float],
+    t_end: float,
+) -> Optional[Dict[str, float]]:
+    """
+    Per-rep metrics:
+      - min/max knee angle
+      - ROM
+      - rep_duration
+      - ecc_time / con_time
+      - bottom_dwell
+      - trunk_at_bottom
+    """
+    features: Dict[str, float] = {}
+    knee = rep_slice.get("knee", [])
+    if len(knee) < 3:
+        return None
+
+    ts = np.array([p[0] for p in knee], dtype=np.float32)
+    xs = np.array([p[1] for p in knee], dtype=np.float32)
+
+    features["min_angle"] = float(xs.min())
+    features["max_angle"] = float(xs.max())
+    features["rom"] = float(xs.max() - xs.min())
+    features["rep_duration"] = float(ts[-1] - ts[0])
+
+    # Phase times
+    features["ecc_time"] = float(max(0.0, (t_bottom - t_start))) if (t_bottom is not None and t_start is not None) else None
+    features["con_time"] = float(max(0.0, (t_end - t_bottom))) if (t_bottom is not None and t_end is not None) else None
+
+    # Bottom dwell (within ±3° of min_angle)
+    def dwell(series, center, band=3.0):
+        tot = 0.0
+        active = False
+        last = None
+        for (tt, x) in series:
+            if abs(x - center) <= band:
+                if not active:
+                    active = True
+                    last = tt
+            else:
+                if active:
+                    tot += max(0.0, tt - (last if last is not None else tt))
+                    active = False
+        if active and last is not None:
+            tot += series[-1][0] - last
+        return float(tot)
+
+    features["bottom_dwell"] = dwell(knee, features["min_angle"])
+
+    # Trunk angle near bottom
+    def closest(series, t_ref):
+        if not series or t_ref is None:
+            return None
+        return min(series, key=lambda p: abs(p[0] - t_ref))[1]
+
+    trunk_series = rep_slice.get("trunk", [])
+    features["trunk_at_bottom"] = closest(trunk_series, t_bottom)
+
+    return features
+
+
+############################################################
+#           EXPERT / PERSONAL PROFILES & SCORING
+############################################################
+
+EXPERT_PROFILE_PATH = "profiles/expert_profile_squat.json"
+PERSONAL_PROFILE_DIR = "user_profiles/default_user/default_station"
+PERSONAL_PROFILE_PATH = os.path.join(PERSONAL_PROFILE_DIR, "squat_personal.json")
+
+os.makedirs(PERSONAL_PROFILE_DIR, exist_ok=True)
+
+
+def load_expert_profile() -> dict:
+    if not os.path.exists(EXPERT_PROFILE_PATH):
+        raise SystemExit("Missing expert profile JSON at profiles/expert_profile_squat.json")
+    return json.load(open(EXPERT_PROFILE_PATH, "r"))
+
+
+def load_personal_profile() -> Optional[dict]:
+    if not os.path.exists(PERSONAL_PROFILE_PATH):
+        return None
+    return json.load(open(PERSONAL_PROFILE_PATH, "r"))
+
+
+def save_personal_profile(profile: dict):
+    json.dump(profile, open(PERSONAL_PROFILE_PATH, "w"), indent=2)
+
+
+def build_personal_profile(rep_packets: List[dict]) -> Optional[dict]:
+    """
+    rep_packets: list of {"features": f, "waves": w}
+    """
+    if not rep_packets:
+        return None
+
+    scalar_keys = [
+        "ecc_time", "con_time", "rep_duration",
+        "min_angle", "max_angle", "rom",
+        "bottom_dwell", "trunk_at_bottom",
+    ]
+    scalars = {k: [] for k in scalar_keys}
+    waves = {"knee": [], "trunk": []}
+
+    for pkt in rep_packets:
+        f = pkt["features"]
+        for k in scalar_keys:
+            v = f.get(k)
+            if v is not None:
+                scalars[k].append(float(v))
+        if pkt["waves"].get("knee"):
+            waves["knee"].append(np.array(pkt["waves"]["knee"], dtype=np.float32))
+        if pkt["waves"].get("trunk"):
+            waves["trunk"].append(np.array(pkt["waves"]["trunk"], dtype=np.float32))
+
+    def fit(arr):
+        arr = np.array(arr, dtype=np.float32)
+        return {"mu": float(arr.mean()), "sigma": float(arr.std() + 1e-6)}
+
+    feature_stats = {k: fit(v) for k, v in scalars.items() if v}
+
+    def wave_stats(stk):
+        if not stk:
+            return None
+        M = np.stack(stk, axis=0)
+        return {
+            "T": int(M.shape[1]),
+            "mean": M.mean(axis=0).tolist(),
+            "std": (M.std(axis=0) + 1e-6).tolist(),
+        }
+
+    template_stats = {
+        "knee": wave_stats(waves["knee"]),
+        "trunk": wave_stats(waves["trunk"]),
+    }
+
+    return {
+        "features": feature_stats,
+        "templates": template_stats,
+        "timestamp": time.time(),
+        "n_reps": len(rep_packets),
+    }
+
+
+GROUP_WEIGHTS = {
+    "depth": 0.45,
+    "control": 0.30,
+    "posture": 0.25,
+}
+
+SEVERITY_CUTS = {
+    "mild": 1.0,
+    "moderate": 2.0,
+    "severe": 3.0,
+}
+
+LAMBDA = {
+    "depth": 0.6,
+    "control": 0.8,
+    "posture": 0.4,
+}
+
+
+def blend_stat(expert: dict, personal: Optional[dict], lam: float) -> dict:
+    if personal is None:
+        return expert
+    mu_e = expert["mu"]
+    sd_e = max(expert["sigma"], 1e-6)
+    mu_p = personal.get("mu", mu_e)
+    sd_p = max(personal.get("sigma", sd_e), 1e-6)
+    mu_b = (1.0 - lam) * mu_e + lam * mu_p
+    sd_b = np.sqrt((1.0 - lam) * sd_e**2 + lam * sd_p**2)
+    return {"mu": float(mu_b), "sigma": float(sd_b)}
+
+
+def blended_profile(expert: dict, personal: Optional[dict]) -> dict:
+    fe_b = {}
+    for k, st_e in expert["features"].items():
+        if k in ["min_angle", "max_angle", "rom"]:
+            grp = "depth"
+        elif k in ["ecc_time", "con_time", "bottom_dwell", "rep_duration"]:
+            grp = "control"
+        else:
+            grp = "posture"
+        lam = LAMBDA[grp]
+        st_p = personal["features"].get(k) if (personal and "features" in personal) else None
+        fe_b[k] = blend_stat(st_e, st_p, lam)
+
+    te_b = {}
+    for name, tmpl_e in expert["templates"].items():
+        if personal and personal.get("templates", {}).get(name):
+            lam = LAMBDA["control"]
+            tmpl_p = personal["templates"][name]
+            mu = (1.0 - lam) * np.array(tmpl_e["mean"]) + lam * np.array(tmpl_p["mean"])
+            sd = np.sqrt(
+                (1.0 - lam) * np.array(tmpl_e["std"]) ** 2
+                + lam * np.array(tmpl_p["std"]) ** 2
+            )
+            te_b[name] = {
+                "T": tmpl_e["T"],
+                "mean": mu.tolist(),
+                "std": (sd + 1e-6).tolist(),
+            }
+        else:
+            te_b[name] = tmpl_e
+
+    return {"features": fe_b, "templates": te_b}
+
+
+def z_penalty(val: Optional[float], mu: float, sd: float) -> float:
+    if val is None or mu is None or sd is None:
+        return 0.0
+    z = abs((val - mu) / max(sd, 1e-6))
+    if z <= SEVERITY_CUTS["mild"]:
+        return 0.0
+    elif z <= SEVERITY_CUTS["moderate"]:
+        return 0.4
+    elif z <= SEVERITY_CUTS["severe"]:
+        return 0.8
+    return 1.2
+
+
+def waveform_penalty(user_wave: Optional[List[float]], tmpl: Optional[dict]) -> float:
+    if user_wave is None or tmpl is None:
+        return 0.0
+    u = np.array(user_wave, dtype=np.float32)
+    m = np.array(tmpl["mean"], dtype=np.float32)
+    s = np.array(tmpl["std"], dtype=np.float32) + 1e-6
+    if u.shape[0] != m.shape[0]:
+        u = np.interp(
+            np.linspace(0.0, 1.0, m.shape[0], dtype=np.float32),
+            np.linspace(0.0, 1.0, u.shape[0], dtype=np.float32),
+            u,
+        )
+    norm_err = np.mean(np.abs((u - m) / s))
+    return float(min(norm_err / 2.5, 1.2))
+
+
+def score_rep(features: dict, waves: dict, profile: dict) -> Tuple[float, str]:
+    F = profile["features"]
+    T = profile["templates"]
+
+    p_depth = np.mean(
+        [
+            z_penalty(features.get("min_angle"), F["min_angle"]["mu"], F["min_angle"]["sigma"]),
+            z_penalty(features.get("max_angle"), F["max_angle"]["mu"], F["max_angle"]["sigma"]),
+            z_penalty(features.get("rom"), F["rom"]["mu"], F["rom"]["sigma"]),
+        ]
+    )
+
+    p_control = np.mean(
+        [
+            z_penalty(features.get("ecc_time"), F["ecc_time"]["mu"], F["ecc_time"]["sigma"]),
+            z_penalty(features.get("con_time"), F["con_time"]["mu"], F["con_time"]["sigma"]),
+            z_penalty(features.get("bottom_dwell"), F["bottom_dwell"]["mu"], F["bottom_dwell"]["sigma"]),
+            z_penalty(features.get("rep_duration"), F["rep_duration"]["mu"], F["rep_duration"]["sigma"]),
+        ]
+    )
+
+    p_posture = z_penalty(
+        features.get("trunk_at_bottom"),
+        F["trunk_at_bottom"]["mu"],
+        F["trunk_at_bottom"]["sigma"],
+    )
+
+    p_shape = np.mean(
+        [
+            waveform_penalty(waves.get("knee"), T.get("knee")),
+            waveform_penalty(waves.get("trunk"), T.get("trunk")),
+        ]
+    )
+
+    total_pen = (
+        GROUP_WEIGHTS["depth"] * p_depth
+        + GROUP_WEIGHTS["control"] * p_control
+        + GROUP_WEIGHTS["posture"] * p_posture
+        + 0.15 * p_shape
+    )
+
+    score = max(0.0, 100.0 - 100.0 * total_pen)
+
+    problems = {
+        "Depth/ROM": p_depth,
+        "Control/Tempo": p_control,
+        "Posture": p_posture,
+        "Shape": p_shape,
+    }
+    main_issue = max(problems.items(), key=lambda kv: kv[1])[0]
+    return float(score), main_issue
+
+
+############################################################
+#                   MAIN SQUAT COACH APP
+############################################################
+
+class SquatCoachApp:
+    def __init__(self):
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            raise SystemExit("Camera not detected.")
+
+        self.frame_w = 1280
+        self.frame_h = 720
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_h)
+
+        self.repdet = RepDetector()
+        self.expert_profile = load_expert_profile()
+        self.personal_profile = load_personal_profile()
+
+        # ERIC LLM
+        self.eric = LLMCoach()
+
+        # Per-frame and per-set state
+        self.traces = {"knee": [], "trunk": []}
+        self.per_rep_rows: List[dict] = []
+        self.warmup_packets: List[dict] = []
+
+        self.mode = "beginner"   # or "expert"
+        self.calibrating = False
+
+        self.voice_enabled = True
+        self.chat_open = False
+        self.chat_history: List[dict] = []
+
+        self.sticky_msg: Optional[str] = None
+        self.fps = 0.0
+        self.last_t = time.time()
+
+        print("\nControls:")
+        print("[T] Tutorial")
+        print("[C] Chat on/off")
+        print("[R] ERIC set report")
+        print("[N] New set (reset)")
+        print("[M] Beginner/Expert toggle (Expert triggers calibration)")
+        print("[V] Voice on/off")
+        print("[Q] Quit\n")
+
+    # -------------- Core loop --------------
+
+    def run(self):
+        while True:
+            ok, frame = self.cap.read()
+            if not ok:
+                break
+
+            now = time.time()
+            dt = now - self.last_t
+            self.last_t = now
+            self.fps = 0.9 * self.fps + 0.1 * ((1.0 / dt) if dt > 0 else 0.0)
+
+            disp = self._process_frame(frame, now)
+            self._draw_hud(disp)
+
+            cv2.imshow("Squat Coach (ERIC)", disp)
+            key = cv2.waitKey(1) & 0xFF
+            if not self._handle_key(key):
+                break
+
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+    # -------------- Frame processing --------------
+
+    def _process_frame(self, frame, t: float):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = pose.process(rgb)
+        lms = result.pose_landmarks.landmark if result.pose_landmarks else None
+
+        disp = frame.copy()
+        if lms:
+            mp_drawing.draw_landmarks(disp, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+        h, w = disp.shape[:2]
+        ang = compute_angles(lms, w, h)
+
+        # Knee angle for rep detection
+        knees = [ang.get("knee_L"), ang.get("knee_R")]
+        knees = [v for v in knees if v is not None]
+        knee_angle = float(np.mean(knees)) if knees else None
+
+        events = self.repdet.update(t, knee_angle)
+
+        # Accumulate traces used for rep slicing
+        if knee_angle is not None:
+            self.traces["knee"].append((t, knee_angle))
+        if ang.get("trunk") is not None:
+            self.traces["trunk"].append((t, float(ang["trunk"])))
+
+        # Clear stale coaching at start of rep
+        if events.get("rep_start"):
+            self.sticky_msg = None
+
+        if events.get("rep_complete"):
+            self._on_rep_complete()
+
+        return disp
+
+    # -------------- Rep completion handler --------------
+
+    def _on_rep_complete(self):
+        t0 = self.repdet.start_t
+        tb = self.repdet.bottom_t
+        te = self.repdet.end_t
+
+        if t0 is None or te is None:
+            self.traces = {"knee": [], "trunk": []}
+            return
+
+        # Slice the time series to this rep window
+        rep_slice = {
+            name: [(tt, xx) for (tt, xx) in series if t0 <= tt <= te]
+            for name, series in self.traces.items()
+        }
+
+        # Extract features
+        feats = extract_rep_features(rep_slice, t0, tb, te)
+        if not feats or feats.get("rom", 0.0) < 25.0:
+            self.sticky_msg = "Rep skipped — range of motion too small."
+            self.traces = {"knee": [], "trunk": []}
+            return
+
+        # Build waveforms for scoring (still numeric, cheap)
+        T_knee = self.expert_profile["templates"]["knee"]["T"]
+        T_trunk = self.expert_profile["templates"]["trunk"]["T"]
+        waves = {
+            "knee": resample_wave(rep_slice["knee"], T=T_knee),
+            "trunk": resample_wave(rep_slice["trunk"], T=T_trunk),
+        }
+
+        # Calibration path (expert mode warm-up)
+        if self.mode == "expert" and self.calibrating:
+            self.warmup_packets.append({"features": feats, "waves": waves})
+            self.sticky_msg = f"Captured warm-up rep {len(self.warmup_packets)} / 12"
+            if len(self.warmup_packets) >= 8:
+                new_profile = build_personal_profile(self.warmup_packets)
+                if new_profile:
+                    save_personal_profile(new_profile)
+                    self.personal_profile = new_profile
+                self.calibrating = False
+                self.sticky_msg = "Calibration complete — personalized scoring active."
+            self.traces = {"knee": [], "trunk": []}
+            return
+
+        # ---------- SCORING (numeric only, no LLM) ----------
+        if self.mode == "beginner":
+            prof = self.expert_profile
+        else:
+            prof = blended_profile(self.expert_profile, self.personal_profile)
+
+        score, issue = score_rep(feats, waves, prof)
+
+        # Lightweight HUD message only
+        self.sticky_msg = f"Rep {self.repdet.rep_count}: {issue} (score {score:.1f})"
+
+        # Store for later set report / chat with ERIC
+        self.per_rep_rows.append(
+            {
+                "idx": self.repdet.rep_count,
+                "score": round(score, 1),
+                "main": issue,
+                "features": feats,
+            }
+        )
+
+        # Reset traces for next rep
+        self.traces = {"knee": [], "trunk": []}
+
+
+    # -------------- HUD drawing --------------
+
+    def _draw_hud(self, disp):
+        # Basic HUD (FPS, mode, voice, reps)
+        cv2.putText(
+            disp,
+            f"FPS: {self.fps:5.1f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            disp,
+            f"Mode: {self.mode.capitalize()}",
+            (20, 75),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
+        cv2.putText(
+            disp,
+            f"Voice: {'ON' if self.voice_enabled else 'OFF'}",
+            (20, 110),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 200, 255),
+            2,
+        )
+        cv2.putText(
+            disp,
+            f"Reps: {self.repdet.rep_count}",
+            (20, 145),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
+
+        # NOTE: we no longer draw self.sticky_msg at all,
+        # so ERIC text never appears on the HUD.
+
+        # Footer controls
+        h = disp.shape[0]
+        controls = "[T] Tutorial  [C] Chat  [R] Report  [N] New set  [M] Mode  [V] Voice  [Q] Quit"
+        cv2.putText(
+            disp,
+            controls,
+            (20, h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+
+
+    def _draw_chat_panel(self, disp):
+        h, w = disp.shape[:2]
+        panel_w = int(w * 0.40)
+        x0 = w - panel_w - 20
+        y0 = 20
+        x1 = w - 10
+        y1 = h - 80
+
+        overlay = disp.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (10, 10, 10), -1)
+        disp[:] = cv2.addWeighted(overlay, 0.7, disp, 0.3, 0)
+
+        cv2.putText(
+            disp,
+            "ERIC Chat",
+            (x0 + 10, y0 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+
+        # Show last few messages
+        y = y0 + 60
+        line_gap = 22
+        for msg in self.chat_history[-10:]:
+            prefix = "You: " if msg["role"] == "user" else "ERIC: "
+            text = prefix + msg["content"]
+            if len(text) > 60:
+                text = text[:57] + "..."
+            cv2.putText(
+                disp,
+                text,
+                (x0 + 10, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (220, 220, 220),
+                1,
+            )
+            y += line_gap
+            if y > y1 - 20:
+                break
+
+    # -------------- Key handling --------------
+
+    def _handle_key(self, key: int) -> bool:
+        if key == ord("q"):
+            return False
+
+        elif key == ord("v"):
+            self.voice_enabled = not self.voice_enabled
+            self.sticky_msg = f"Voice {'ON' if self.voice_enabled else 'OFF'}"
+
+        elif key == ord("n"):
+            self.per_rep_rows.clear()
+            self.repdet.rep_count = 0
+            self.sticky_msg = "New set started."
+
+        elif key == ord("t"):
+            self._handle_tutorial()
+
+        elif key == ord("m"):
+            self._toggle_mode()
+
+        elif key == ord("r"):
+            self._handle_set_report()
+
+
+        elif key == ord("c"):
+
+            # Toggle chat window; chat input happens in the console
+
+            if self.chat_open:
+
+                self.chat_open = False
+
+                self.sticky_msg = "ERIC chat closed."
+
+            else:
+
+                self.chat_open = True
+
+                self.sticky_msg = "ERIC chat open — type in console (blank line = exit)."
+
+                # This blocks the video loop while you chat, which is fine.
+
+                self._chat_session_console()
+
+        return True
+
+    # -------------- Tutorial --------------
+
+    def _handle_tutorial(self):
+        last_issue = self.per_rep_rows[-1]["main"] if self.per_rep_rows else None
+        try:
+            tutorial = self.eric.tutorial(last_issue)
+        except Exception as e:
+            tutorial = f"ERIC error (tutorial): {e}"
+
+        self.sticky_msg = "ERIC tutorial shown in chat."
+        # Drop the tutorial as an assistant message in chat history
+        self.chat_open = True
+        self.chat_history.append({"role": "assistant", "content": tutorial})
+        if self.voice_enabled:
+            speak(tutorial)
+
+    # -------------- Mode toggle / calibration --------------
+
+    def _toggle_mode(self):
+        if self.mode == "beginner":
+            self.mode = "expert"
+            self.calibrating = True
+            self.warmup_packets.clear()
+            self.sticky_msg = "Expert mode — perform 8–12 warm-up reps."
+        else:
+            self.mode = "beginner"
+            self.calibrating = False
+            self.sticky_msg = "Beginner mode — scoring vs expert profile."
+
+    # -------------- Set report --------------
+
+    def _build_set_summary(self) -> dict:
+        """
+        Build a per-rep summary for ERIC's set_report().
+        Each rep entry includes its index, main issue, and key features,
+        plus global expert targets.
+        """
+        expert_feats = self.expert_profile["features"]
+
+        rep_entries = []
+        for row in self.per_rep_rows:
+            f = row["features"]
+            rep_entries.append({
+                "rep_idx": row["idx"],
+                "main_issue": row["main"],
+                "rom": f.get("rom"),
+                "min_angle": f.get("min_angle"),
+                "max_angle": f.get("max_angle"),
+                "trunk_at_bottom": f.get("trunk_at_bottom"),
+                "ecc_time": f.get("ecc_time"),
+                "con_time": f.get("con_time"),
+                "bottom_dwell": f.get("bottom_dwell"),
+            })
+
+        return {
+            "num_reps": len(self.per_rep_rows),
+            "expert_targets": {
+                "rom": expert_feats["rom"]["mu"],
+                "min_angle": expert_feats["min_angle"]["mu"],
+                "max_angle": expert_feats["max_angle"]["mu"],
+                "trunk_at_bottom": expert_feats["trunk_at_bottom"]["mu"],
+            },
+            "reps": rep_entries,
+        }
+
+    def _handle_set_report(self):
+        """Ask ERIC for a per-rep set report (triggered by 'R')."""
+        if not self.per_rep_rows:
+            self.sticky_msg = "No reps yet — do a set first."
+            return
+
+        # Build the numeric summary we feed into ERIC
+        summary = self._build_set_summary()
+
+        try:
+            print("[ERIC] Generating set report...")
+            text = self.eric.set_report(summary)
+        except Exception as e:
+            text = f"ERIC error (report): {e}"
+            print(text)
+
+        # Open chat panel and drop the full report into history
+        self.chat_open = True
+        self.chat_history.append({"role": "assistant", "content": text})
+
+        # Show the first line as the sticky HUD message so you see something immediately
+        first_line = text.splitlines()[0] if text.strip() else "ERIC set report ready."
+        self.sticky_msg = first_line[:80]
+
+        # Optional read-out
+        if self.voice_enabled:
+            speak(text)
+
+    # -------------- Chat session (console input) --------------
+
+    def _chat_session_console(self):
+        """
+        Simple console-based chat loop:
+          - While chat panel is visible on video.
+          - Press ENTER with empty input to exit.
+          - Type 'm' alone to use microphone input once.
+        """
+        print("\n--- ERIC chat ---")
+        print("Type your question and press ENTER.")
+        print("Press ENTER on an empty line to exit chat.")
+        print("Type 'm' on a line by itself to speak with the microphone.\n")
+
+        while True:
+            try:
+                user_text = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[Chat closed]\n")
+                break
+
+            if user_text == "":
+                print("[Chat closed]\n")
+                break
+
+            # Microphone path
+            if user_text.lower() == "m":
+                try:
+                    import speech_recognition as sr
+                except ImportError:
+                    print("speech_recognition is not installed. Run 'pip install SpeechRecognition pyaudio' first.")
+                    continue
+
+                recognizer = sr.Recognizer()
+                mic = sr.Microphone()
+                print("Speak now...")
+                with mic as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                try:
+                    user_text = recognizer.recognize_google(audio)
+                    print(f"(Heard): {user_text}")
+                except Exception as e:
+                    print(f"Sorry, could not understand audio: {e}")
+                    continue
+
+            # Add user message to history
+            self.chat_history.append({"role": "user", "content": user_text})
+
+            # ERIC reply
+
+            try:
+                reply = self.eric.chat_reply(self.chat_history)
+            except Exception as e:
+                reply = f"ERIC error (chat): {e}"
+
+            self.chat_history.append({"role": "assistant", "content": reply})
+            print(f"ERIC: {reply}\n")
+
+            # NEW: speak reply if voice is enabled
+            if self.voice_enabled:
+                speak(reply)
+
+        # After loop, keep chat panel open but stop console chat
+        self.sticky_msg = "ERIC chat closed. Press C again to reopen."
+
+
+############################################################
+# RUN
+############################################################
+
+if __name__ == "__main__":
+    app = SquatCoachApp()
+    app.run()
