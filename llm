@@ -1,0 +1,177 @@
+import json
+from llama_cpp import Llama
+
+SYSTEM_PROMPT = """
+You are ERIC, an expert squat coach.
+You always give biomechanically correct, precise, and friendly guidance.
+You ONLY rely on the numerical squat metrics and descriptions provided.
+You NEVER hallucinate numbers that were not provided.
+You speak like a real personal trainer: encouraging, concise, actionable.
+"""
+
+
+class LLMCoach:
+    """
+    Wrapper around a local Phi / GGUF model using llama-cpp-python.
+    Provides:
+      - rep_summary(features, score, issue)
+      - tutorial(issue)
+      - chat_reply(history)
+      - set_report(set_summary_dict)
+    """
+
+    def __init__(
+        self,
+        model_path: str = "models/Phi-3.5-mini-instruct.Q4_K_M.gguf",
+        n_ctx: int = 4096,
+        n_threads: int = 8,
+        n_gpu_layers: int = 0,
+    ):
+        print(f"[ERIC] Loading local model from: {model_path}")
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,
+        )
+        print("[ERIC] Model loaded.")
+
+    # ---------- core call ----------
+
+    def _call(self, prompt: str, max_tokens: int = 200, temperature: float = 0.4) -> str:
+        out = self.llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        text = out["choices"][0]["text"]
+        return text.strip()
+
+    # ---------- per-rep summary ----------
+
+    def rep_summary(self, features: dict, score: float, issue: str) -> str:
+        """
+        Create a 1–2 sentence summary for a single rep.
+        """
+        feat_json = json.dumps(features, indent=2)
+
+        prompt = f"""{SYSTEM_PROMPT}
+
+You are analyzing a single squat repetition.
+
+Rep score (0-100): {score:.1f}
+Main problem category: {issue}
+
+Extracted numerical features for this rep:
+{feat_json}
+
+Based ONLY on these features:
+- Write 1–2 short sentences of coaching feedback.
+- Explain what went well and what needs improvement.
+- Give exactly ONE concrete cue or adjustment the user can try on the next rep.
+
+Do NOT restate the score or category by name.
+Speak as ERIC talking directly to the user.
+ERIC:
+"""
+        return self._call(prompt, max_tokens=140, temperature=0.45)
+
+    # ---------- tutorial ----------
+
+    def tutorial(self, issue: str | None = None) -> str:
+        """
+        Return a 4–6 sentence squat tutorial.
+        If `issue` is provided, emphasize that theme.
+        """
+        focus = ""
+        if issue:
+            focus = f"\nEmphasize how to improve this recurring issue: {issue}."
+
+        prompt = f"""{SYSTEM_PROMPT}
+
+The user wants a short tutorial on how to perform a proper back squat.{focus}
+
+Write 4–6 sentences that cover:
+- stance and setup
+- depth and range of motion
+- trunk and pelvis posture
+- tempo and control
+- 1–2 common mistakes and how to fix them
+
+Do NOT mention scores, statistics, or 'main issue' labels.
+Speak as ERIC talking directly to the user.
+ERIC:
+"""
+        return self._call(prompt, max_tokens=220, temperature=0.5)
+
+    # ---------- free-form chat ----------
+
+    def chat_reply(self, history: list[dict]) -> str:
+        """
+        Continue a free-form chat.
+        history: list of {"role": "user"/"assistant", "content": "..."}
+        Keeps only the last ~8 turns to stay fast.
+        """
+        trimmed = history[-8:]
+        text = SYSTEM_PROMPT.strip() + "\n\n"
+        for msg in trimmed:
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            if role == "assistant":
+                text += f"ERIC: {content}\n"
+            else:
+                text += f"User: {content}\n"
+        text += "ERIC: "
+        return self._call(text, max_tokens=260, temperature=0.45)
+
+    # ---------- per-rep set report ----------
+
+    def set_report(self, set_summary: dict) -> str:
+        """
+        Given per-rep metrics + expert targets, write one line per rep.
+
+        set_summary format:
+        {
+          "num_reps": int,
+          "expert_targets": {...},
+          "reps": [
+            {
+              "rep_idx": int,
+              "main_issue": str,
+              "rom": float or None,
+              "min_angle": float or None,
+              "max_angle": float or None,
+              "trunk_at_bottom": float or None,
+              "ecc_time": float or None,
+              "con_time": float or None,
+              "bottom_dwell": float or None,
+            },
+            ...
+          ]
+        }
+        """
+        summary_json = json.dumps(set_summary, indent=2)
+
+        prompt = f"""{SYSTEM_PROMPT}
+
+You are summarizing a full squat set for the user.
+
+You are given, for each rep, its rep index, main issue label, and a few key
+numerical features, plus some expert target angles:
+
+{summary_json}
+
+Based ONLY on this information:
+
+- For each rep in order, write ONE short sentence, starting with "Rep N:".
+- Say what needs fixing and HOW to fix it, using simple cues
+  (e.g., "Rep 3: sit a bit deeper and keep your chest taller").
+- You may say things like "a bit deeper" or "slightly more upright",
+  but do NOT invent precise angle numbers that are not clearly implied.
+- Do NOT mention scores, statistics, averages, or the words "issue counts".
+
+Output just the lines, one per rep.
+ERIC:
+"""
+        return self._call(prompt, max_tokens=300, temperature=0.45)
